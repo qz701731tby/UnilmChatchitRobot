@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from torch.nn.modules.loss import _Loss
 from transformers.modeling_utils import PreTrainedModel
 from configuration_unilm import UnilmConfig
-from transformers.modeling_bert import load_tf_weights_in_bert, BertPooler, BertIntermediate, BertOutput, BertPredictionHeadTransform, BertSelfOutput, BertLMPredictionHead, BertOnlyMLMHead, BertOnlyMLMHead, BertEmbeddings, BertOnlyNSPHead
+from transformers.models.bert.modeling_bert import load_tf_weights_in_bert, BertPooler, BertIntermediate, BertOutput, BertPredictionHeadTransform, BertSelfOutput, BertLMPredictionHead, BertOnlyMLMHead, BertOnlyMLMHead, BertEmbeddings, BertOnlyNSPHead
 
 logger = logging.getLogger(__name__)
 UNILM_PRETRAINED_MODEL_ARCHIVE_MAP = {
@@ -49,11 +49,13 @@ class BertSelfAttention(nn.Module):
     def forward(self, hidden_states, attention_mask, history_states=None):
         if history_states is None:
             mixed_query_layer = self.query(hidden_states)
+            # print("hidden_states: ", hidden_states)
             mixed_key_layer = self.key(hidden_states)
             mixed_value_layer = self.value(hidden_states)
         else:
             x_states = torch.cat((history_states, hidden_states), dim=1)
-            mixed_query_layer = self.query(hidden_states)
+            # print("x_states: ", x_states)
+            mixed_query_layer = self.query(hidden_states) # query只需要当前token的
             mixed_key_layer = self.key(x_states)
             mixed_value_layer = self.value(x_states)
 
@@ -66,7 +68,6 @@ class BertSelfAttention(nn.Module):
         attention_scores = attention_scores + attention_mask
 
         attention_probs = nn.Softmax(dim=-1)(attention_scores)
-
         attention_probs = self.dropout(attention_probs)
 
         context_layer = torch.matmul(attention_probs, value_layer)
@@ -86,6 +87,8 @@ class BertAttention(nn.Module):
     def forward(self, input_tensor, attention_mask, history_states=None):
         self_output = self.self(
             input_tensor, attention_mask, history_states=history_states)
+        assert self_output.shape == input_tensor.shape
+        # if not history_states:
         attention_output = self.output(self_output, input_tensor)
         return attention_output
 
@@ -119,6 +122,7 @@ class BertEncoder(nn.Module):
         if (prev_embedding is not None) and (prev_encoded_layers is not None):
             history_states = prev_embedding
             for i, layer_module in enumerate(self.layer):
+                # print("layer ", i)
                 hidden_states = layer_module(
                     hidden_states, attention_mask, history_states=history_states)
                 if output_all_encoded_layers:
@@ -126,7 +130,8 @@ class BertEncoder(nn.Module):
                 if prev_encoded_layers is not None:
                     history_states = prev_encoded_layers[i]
         else:
-            for layer_module in self.layer:
+            for i, layer_module in enumerate(self.layer):
+                # print("layer ", i)
                 hidden_states = layer_module(
                     hidden_states, attention_mask)
                 if output_all_encoded_layers:
@@ -181,7 +186,6 @@ class UnilmModel(UnilmPreTrainedModel):
     def forward(self, input_ids, token_type_ids=None, attention_mask=None, output_all_encoded_layers=True):
         extended_attention_mask = self.get_extended_attention_mask(
             input_ids, token_type_ids, attention_mask)
-
         embedding_output = self.embeddings(
             input_ids, token_type_ids)
         encoded_layers = self.encoder(embedding_output, extended_attention_mask,
@@ -202,13 +206,17 @@ class UnilmModelIncr(UnilmModel):
         extended_attention_mask = self.get_extended_attention_mask(
             input_ids, token_type_ids, attention_mask)
 
+        # print("input_ids: ", input_ids)
+        # print("token_type_ids: ", token_type_ids)
         embedding_output = self.embeddings(
             input_ids, token_type_ids, position_ids)
+        # print("embedding_output: ", embedding_output)
         encoded_layers = self.encoder(embedding_output,
                                       extended_attention_mask,
                                       output_all_encoded_layers=output_all_encoded_layers,
                                       prev_embedding=prev_embedding,
                                       prev_encoded_layers=prev_encoded_layers)
+
         sequence_output = encoded_layers[-1]
         pooled_output = self.pooler(sequence_output)
         if not output_all_encoded_layers:
@@ -709,7 +717,31 @@ class UnilmForSeq2SeqDecodeSample(UnilmPreTrainedModel):
                                    self.bert.embeddings.word_embeddings)
 
     def forward(self, input_ids, token_type_ids, attention_mask):
-        sequence_output, __ = self.bert(input_ids, token_type_ids, attention_mask, output_all_encoded_layers=False)
-        last_hidden = sequence_output[:, -1:, :]
+        encoded_layers, __ = self.bert(input_ids, token_type_ids, attention_mask, output_all_encoded_layers=False)
+        last_hidden = encoded_layers[:, -1:, :]
         prediction_scores = self.cls(last_hidden)
         return prediction_scores
+
+
+class UnilmForSeq2SeqDecodeSampleCached(UnilmPreTrainedModel):
+    def __init__(self, config):
+        super(UnilmForSeq2SeqDecodeSampleCached, self).__init__(config)
+        self.bert = UnilmModelIncr(config)
+        self.cls = BertOnlyMLMHead(config)
+        self.init_weights()
+        self.tie_weights()
+
+    def tie_weights(self):
+        self._tie_or_clone_weights(self.cls.predictions.decoder,
+                                   self.bert.embeddings.word_embeddings)
+
+    def forward(self, input_ids, token_type_ids,  attention_mask, position_ids=None, output_all_encoded_layers=False, prev_embedding=None, prev_encoded_layers=None):
+        embedding_output, encoded_layers, _ = self.bert(input_ids, token_type_ids, position_ids, attention_mask, 
+                                    output_all_encoded_layers=output_all_encoded_layers,
+                                prev_embedding=prev_embedding, prev_encoded_layers=prev_encoded_layers)
+        if output_all_encoded_layers:
+            last_hidden = encoded_layers[-1][:, -1:, :]
+        else:
+            last_hidden = encoded_layers[:, -1:, :]
+        prediction_scores = self.cls(last_hidden)
+        return embedding_output, encoded_layers, prediction_scores
